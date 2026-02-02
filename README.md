@@ -7,8 +7,9 @@ TradingView Pine Script strategy for analyzing session-based Auction Market Theo
 - Defines active, reference, and overnight sessions.
 - Computes VPOC and value area from a session volume profile histogram.
 - Tracks session break counts (e.g., VAH/VAL/VPOC, ONH/ONL, IB ranges).
-- Optional visual overlays for reference, overnight, and intraday levels.
-- Optional strategy order entries for testing scenarios.
+
+![AMT statistics example](assets/amt_statistic.png)
+
 
 ## Layout
 
@@ -26,7 +27,4 @@ TradingView Pine Script strategy for analyzing session-based Auction Market Theo
 3. Configure sessions and filters in the Inputs panel.
 4. Run the strategy on an intraday chart (1min to 1h).
 
-## Examples
-
-![AMT statistics example](assets/amt_statistic.png)
 
