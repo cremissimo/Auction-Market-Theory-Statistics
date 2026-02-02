@@ -26,3 +26,7 @@ TradingView Pine Script strategy for analyzing session-based Auction Market Theo
 3. Configure sessions and filters in the Inputs panel.
 4. Run the strategy on an intraday chart (1min to 1h).
 
+## Examples
+
+![AMT statistics example](assets/amt_statistic.png)
+
