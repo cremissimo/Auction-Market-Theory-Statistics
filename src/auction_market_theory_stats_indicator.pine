@@ -1,0 +1,1139 @@
+
+//@version=6
+indicator("AMT Statistics", overlay=true)
+
+// === INPUTS ===
+
+// Start and end inputs
+all_history = input.bool(true,  "Use all historical datapoints")
+start = input.time(timestamp("2020-08-26"), "Start Date", group = "Custom historical range")  // 7 days ago
+end   = input.time(timestamp("2025-09-02"), "End Date", group = "Custom historical range")    // today
+
+inRange = time >= start and time <= end
+
+
+// Inputs to control filtering
+testWeekdays = input.bool(true,  "Enable Weekdays")
+testWeekend  = input.bool(false, "Enable Weekend")
+
+// Current day of week
+d = dayofweek(time)
+
+// Build flags
+isWeekday = d >= dayofweek.monday and d <= dayofweek.friday
+isWeekend = d == dayofweek.saturday or d == dayofweek.sunday
+
+// Only allow signals if matching filters
+allowTrading = (testWeekdays and isWeekday) or (testWeekend and isWeekend)
+
+
+// Today’s active session (where we check for breaks)
+// london session 0200-0830
+// london ref session 0830-1500
+// overnight 1500-0200
+// todaySession = input.session("0900-1630", "Today's Active Session", options = ["0900-1630", "0200-0830"]) // ["0900-1630", "1330-2000","1630-0900", "2000-1330"]
+
+// // Previous day's reference session (levels to compare against)
+// referenceSession = input.session("0900-1630", "Previous Day Reference Session", options = ["0900-1630", "0830-1500"])
+
+// // Optional overnight session
+// overnightSession = input.session("1630-0900", "Overnight Session", options = ["1630-0900", "1500-0200"])
+// Today’s active session (where we check for breaks)""
+todaySession = input.session("0830-1600", "Today's Active Session", options = ["0830-1600","1600-0830", "0200-0830","0900-1730"]) // ["0830-1600", "1330-2000","1600-0830", "2000-1330"]
+
+// Previous day's reference session (levels to compare against)
+referenceSession = input.session("0830-1600", "Previous Day Reference Session",  options = ["0830-1600","1600-0830","0900-1730"])
+
+// Optional overnight session
+overnightSession = input.session("1700-0830", "Overnight Session", options = ["0830-1600","1700-0830", "1600-0200", "1730-0900"])
+
+// Show visuals
+showRefLevels = input.bool(false, "Show RTH Levels", group = "Levels")
+showONLevels = input.bool(false, "Show ETH Levels", group = "Levels")
+showIBlevels = input.bool(false, "Show IB Levels", group = "Levels")
+
+
+// === SESSION DETECTION ===
+inTodaySession = not na(time(timeframe.period, todaySession))
+inReferenceSession = not na(time(timeframe.period, referenceSession))
+inOvernight = not na(time(timeframe.period, overnightSession))
+dayChange = ta.change(time("D")) != 0
+newTodaySession    = inTodaySession and not inTodaySession[1]
+newOvernightSession    = inOvernight and not inOvernight[1]
+
+
+// Session colors
+colorSession1 = input.bool(false, "Today session", group = "Color sessions")
+colorSession2 = input.bool(false, "Reference session", group = "Color sessions")
+colorSession3 = input.bool(false, "Overnight session", group = "Color sessions")
+
+//Used in value area calculation
+numOfHistograms = input.int(200, "Number of Histograms", minval=20, maxval=300)
+valueAreaPct = input.float(0.70, "Value Area %", step=0.05)
+
+
+// Compute color per bar
+session1Color = colorSession1 and inTodaySession  ? color.new(color.green, 85) : na
+session2Color = colorSession2 and inReferenceSession ? color.new(color.red, 85)  : na
+session3Color = colorSession3 and inOvernight ? color.new(color.yellow, 85)  : na
+
+// Apply background
+bgcolor(session1Color)
+bgcolor(session2Color)
+bgcolor(session3Color)
+
+
+// Volume Profile 
+// calculates the value area of the volume profile
+f_get_value_area(_buyVolList, _sellVolList, _highList, _lowList, _indexPoc, _vpocVol, _totalVol, _valueArea) =>
+    _n = array.size(_buyVolList)
+    areaVol = _vpocVol
+    upper = _indexPoc
+    lower = _indexPoc
+    threshold =  _valueArea * _totalVol
+    while areaVol < threshold
+        nextU = upper + 1
+        nextL = lower - 1
+        volU = nextU < _n ? array.get(_buyVolList, nextU) + array.get(_sellVolList, nextU) : 0
+        volL = nextL >= 0 ? array.get(_buyVolList, nextL) + array.get(_sellVolList, nextL) : 0
+        if volU >= volL and nextU < _n
+            areaVol += volU
+            upper += 1
+        else if nextL >= 0
+            areaVol += volL
+            lower -= 1
+        else
+            break
+    [array.get(_highList, upper), array.get(_lowList, lower)]
+
+//────────────────────────────
+// Function: calculates the vpoc 
+//────────────────────────────
+f_calculate_vpoc(rangeLow, rangeHigh, sessionBarCounter, numHistograms) =>
+    rangeH = rangeHigh - rangeLow
+    histH  = rangeH / numHistograms
+
+    // Create histogram arrays
+    hLow  = array.new_float(numHistograms)
+    hHigh = array.new_float(numHistograms)
+    hBuy  = array.new_float(numHistograms, 0.0)
+    hSell = array.new_float(numHistograms, 0.0)
+
+    // Initialize price bins
+    for i = 0 to numHistograms - 1
+        array.set(hLow, i, rangeLow + histH * i)
+        array.set(hHigh, i, rangeLow + histH * (i + 1))
+
+    maxLookback = 100
+    if sessionBarCounter > 0 and bar_index > 0
+        lookback = math.min(sessionBarCounter - 1, maxLookback)
+
+        // lookback = math.min(sessionBarCounter - 1, bar_index )
+        // Fill histogram with volume
+        // if sessionBarCounter > 0
+        for i = 0 to lookback
+            if high[i] != low[i]    
+                for j = 0 to numHistograms - 1
+                    lowJ  = array.get(hLow, j)
+                    highJ = array.get(hHigh, j)
+                    overlap = math.max(0, math.min(high[i], highJ) - math.max(low[i], lowJ))
+                    if overlap > 0
+                        frac = overlap / (high[i] - low[i])
+                        buyVol  = volume[i] * (close[i] - low[i]) / (high[i] - low[i]) * frac
+                        sellVol = volume[i] * (high[i] - close[i]) / (high[i] - low[i]) * frac
+                        array.set(hBuy, j,  array.get(hBuy, j)  + buyVol)
+                        array.set(hSell, j, array.get(hSell, j) + sellVol)
+
+    // Identify VPOC
+    vpocVol = 0.0
+    idxPoc = 0
+    _totalVol = 0.0
+    for i = 0 to numHistograms - 1
+        vol = array.get(hBuy, i) + array.get(hSell, i)
+        _totalVol += vol
+        if vol > vpocVol
+            vpocVol := vol
+            idxPoc := i
+    _VPOC = math.round_to_mintick((array.get(hHigh, idxPoc) + array.get(hLow, idxPoc)) / 2)
+    [_VPOC, hBuy, hSell, hHigh, hLow, idxPoc, vpocVol, _totalVol]
+
+type breakCounters
+
+    int sessionCounts = 0
+
+    // previous sessions breaks
+    int pHi = 0
+    int pLo = 0
+    int pHiAndpLo = 0
+    int pHiorpLo = 0
+    int vaHi = 0
+    int vaLo = 0
+    int vpoc = 0
+
+    int vaLoAndVaHI = 0
+    int vaLoOrVaHi = 0
+
+    // overnight session level breaks
+    int onHi = 0
+    int onLo = 0
+    int onVpoc = 0
+    int onLowOrOnHi = 0
+    int onLoAndOnHi = 0
+
+    // in session breaks
+    int IBLowandIBH = 0
+    int IBLoworIBH = 0
+    int IBLow1_5orIBH1_5 = 0
+    int IBLow2orIBH2 = 0
+
+    int IBHi = 0 
+    int IBHi1_5 = 0 
+    int IBHi2 = 0 
+    int IBLo = 0 
+    int IBLo1_5 = 0 
+    int IBLo2 = 0 
+
+
+var breakRef = breakCounters.new()
+var HORbreakRef = breakCounters.new()
+var LORbreakRef = breakCounters.new()
+var HIRbreakRef = breakCounters.new()
+var LIRbreakRef = breakCounters.new()
+
+var ORbreakRef = breakCounters.new()
+var IRbreakRef = breakCounters.new()
+
+// === VARIABLES ===
+// Temp vars
+
+type KeyLevel
+    float high = na
+    float low  = na
+    float mid  = na
+    float vah     = na
+    float val     = na
+    float vpoc    = na
+    float ibh = na
+    float ibl  = na
+    float ibl1_5  = na
+    float ibh1_5  = na
+    float ibh2  = na
+    float ibl2  = na
+
+var sessionLevels = KeyLevel.new()
+var prevSessionLevels = KeyLevel.new()
+var ONLevels = KeyLevel.new()
+var prevONLevels = KeyLevel.new()
+
+// RTH VPOC
+
+var int   sessionBarCount = 0
+var int   ONsessionBarCount = 0
+
+// Daily one-time flags
+
+type BreakFlags
+    bool high = false
+    bool low = false
+    bool vah = false
+    bool val = false
+    bool vpoc = false
+    bool ibh = false
+    bool ibh1_5 = false
+    bool ibh2 = false
+    bool ibl = false
+    bool ibl1_5 = false
+    bool ibl2 = false
+
+    bool HighandLow = false
+    bool LoworHigh = false
+
+    bool VALandVAH = false
+    bool VALorVAH = false
+
+    bool IBLandIBH = false
+    bool IBLorIBH = false
+
+var brokeSession = BreakFlags.new()
+var brokeON = BreakFlags.new()
+
+
+// For volume aggregation (to calculate VPOC / VAH / VAL)
+var float[] priceArray = array.new_float()
+var float[] volArray = array.new_float()
+var float[] onPriceArray = array.new_float()
+var float[] onVolArray = array.new_float()
+
+
+// === VARIABLES IBH IBL ===
+var int firstHourStartTime = na
+var bool firstHourEnded = false
+
+var string openType = ""
+var float sessionOpenPrice = 0
+
+
+// === RESET ON NEW SESSION ===
+if newTodaySession
+    sessionOpenPrice := open
+    firstHourStartTime := time
+    firstHourEnded := false
+
+    // Store previous reference session levels
+    prevSessionLevels.high := sessionLevels.high
+    prevSessionLevels.low  := sessionLevels.low
+    prevSessionLevels.mid  := sessionLevels.mid
+    prevSessionLevels.vah     := sessionLevels.vah
+    prevSessionLevels.val     := sessionLevels.val
+    prevSessionLevels.vpoc    := sessionLevels.vpoc
+
+    // Reset daily variables
+    sessionLevels := KeyLevel.new()
+
+    brokeSession := BreakFlags.new()
+    brokeON := BreakFlags.new()
+
+    openType := ""
+    // Store overnight session levels
+    prevONLevels.high := ONLevels.high
+    prevONLevels.low  := ONLevels.low
+    prevONLevels.mid  := ONLevels.mid
+    prevONLevels.vpoc := ONLevels.vpoc
+
+
+    // reset counter for VPOC calculations
+    sessionBarCount := 0
+
+if newOvernightSession
+    ONsessionBarCount := 0
+    ONLevels := KeyLevel.new()
+
+// === RESET AT NEW DAY ===
+if dayChange
+    array.clear(priceArray)
+    array.clear(volArray)
+    array.clear(onPriceArray)
+    array.clear(onVolArray)
+
+// === BUILD REFERENCE SESSION (YESTERDAY'S) ===
+if inReferenceSession
+
+    // session high and low
+    sessionLevels.high := na(sessionLevels.high) ? high : math.max(sessionLevels.high, high)
+    sessionLevels.low  := na(sessionLevels.low)  ? low  : math.min(sessionLevels.low, low)
+    sessionLevels.mid  := (sessionLevels.high + sessionLevels.low) / 2
+
+    array.push(priceArray, close)
+    array.push(volArray, volume)
+
+    sessionBarCount +=1
+
+// Calculate Reference Session Profile at session close
+if inReferenceSession[1] and not inReferenceSession
+
+    breakRef.sessionCounts += 1
+    
+    // Compute VPOC
+    [VPOC, hBuy, hSell, hHigh, hLow, idxPoc, vpocVol, totalVol] = f_calculate_vpoc(sessionLevels.low, sessionLevels.high, sessionBarCount, numOfHistograms)
+
+    // Compute VAH/VAL
+    [VAH, VAL] = f_get_value_area(hBuy, hSell, hHigh, hLow, idxPoc, vpocVol, totalVol, valueAreaPct)
+
+    sessionLevels.vpoc := VPOC
+    sessionLevels.vah := VAH
+    sessionLevels.val := VAL
+
+    if showRefLevels
+        label.new(bar_index, VAL, text="VAL" + str.tostring(VAL), style=label.style_label_up, color=color.new(color.yellow, 0), textcolor=color.black, size=size.small)
+        label.new(bar_index, VAH, text="VAH" + str.tostring(VAH), style=label.style_label_up, color=color.new(color.yellow, 0), textcolor=color.black, size=size.small)
+        label.new(bar_index, VPOC, text="VPOC" + str.tostring(VPOC), style=label.style_label_up, color=color.new(color.yellow, 0), textcolor=color.black, size=size.small)
+
+
+// === BUILD OVERNIGHT SESSION ===
+if inOvernight
+    ONsessionBarCount += 1
+
+
+    ONLevels.high := na(ONLevels.high) ? high : math.max(ONLevels.high, high)
+    ONLevels.low  := na(ONLevels.low)  ? low  : math.min(ONLevels.low, low)
+    ONLevels.mid  := (ONLevels.high + ONLevels.low) / 2
+
+    array.push(onPriceArray, close)
+    array.push(onVolArray, volume)
+
+// Calculate Overnight POC at overnight session close
+if inOvernight[1] and not inOvernight
+
+    // Compute VPOC
+    [_onVpoc, _, _, _, _, _, _, _] = f_calculate_vpoc(ONLevels.low, ONLevels.high, ONsessionBarCount, numOfHistograms)
+    ONLevels.vpoc := _onVpoc 
+    
+    if showONLevels
+        label.new(bar_index, ONLevels.high, text="ONH " + str.tostring(ONLevels.high), style=label.style_label_up, color=color.red, textcolor=color.black, size=size.small)
+        label.new(bar_index, ONLevels.low, text="ONL " + str.tostring(ONLevels.low), style=label.style_label_up, color=color.red, textcolor=color.black, size=size.small)        
+        label.new(bar_index, ONLevels.vpoc, text="ONVPOC " + str.tostring(ONLevels.vpoc), style=label.style_label_up, color=color.red, textcolor=color.black, size=size.small)
+
+// === DETECT TODAY'S OPEN CLASSIFICATION ===
+if newTodaySession and (inRange or all_history) and allowTrading
+
+
+    // Compare to Reference Session
+    if not na(prevSessionLevels.vpoc) and open > prevSessionLevels.vpoc and open < prevSessionLevels.high and open > prevSessionLevels.low
+        HIRbreakRef.sessionCounts +=1
+        openType := "HIR"
+    else if not na(prevSessionLevels.vpoc) and open < prevSessionLevels.vpoc and open < prevSessionLevels.high and open > prevSessionLevels.low
+        LIRbreakRef.sessionCounts +=1
+        openType := "LIR"
+    else if open < prevSessionLevels.low
+        LORbreakRef.sessionCounts +=1
+        openType := "LOR"
+    else if open > prevSessionLevels.high
+        HORbreakRef.sessionCounts +=1
+        openType := "HOR"
+
+
+// === DETECT BREAKS DURING TODAY'S SESSION ===
+if inTodaySession and (inRange or all_history) and allowTrading
+    // IBH break check
+    if not na(sessionLevels.ibh) and high >= sessionLevels.ibh and not  brokeSession.ibh and firstHourEnded
+
+        if showIBlevels
+            label.new(bar_index, sessionLevels.ibh, text="IBH broken " + str.tostring(sessionLevels.ibh), style=label.style_label_up, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
+        
+        brokeSession.ibh := true
+        breakRef.IBHi +=1
+
+        switch openType
+            "HIR" => HIRbreakRef.IBHi += 1
+            "HOR" => HORbreakRef.IBHi += 1
+            "LOR" => LORbreakRef.IBHi += 1
+            "LIR" => LIRbreakRef.IBHi += 1
+            => 
+                log.error("openType undefined")
+
+    // IBL break check
+    if not na(sessionLevels.ibl) and low <= sessionLevels.ibl and not brokeSession.ibl and firstHourEnded
+        
+        if showIBlevels
+            label.new(bar_index, sessionLevels.ibl, text="IBL broken " + str.tostring(sessionLevels.ibl), style=label.style_label_up, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
+        breakRef.IBLo += 1
+        brokeSession.ibl := true
+
+        switch openType
+            "HIR" => HIRbreakRef.IBLo += 1
+            "HOR" => HORbreakRef.IBLo += 1
+            "LOR" => LORbreakRef.IBLo += 1
+            "LIR" => LIRbreakRef.IBLo += 1
+            => 
+                log.error("openType undefined")
+    // IBH 1.5
+    if not na(sessionLevels.ibh1_5) and high >= sessionLevels.ibh1_5 and not  brokeSession.ibh1_5 and firstHourEnded
+
+        if showIBlevels
+            label.new(bar_index, sessionLevels.ibh1_5, text="IBH1.5 broken " + str.tostring(sessionLevels.ibh1_5), style=label.style_label_up, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
+        
+        brokeSession.ibh1_5 := true
+        breakRef.IBHi1_5 +=1
+
+        switch openType
+            "HIR" => HIRbreakRef.IBHi1_5 += 1
+            "HOR" => HORbreakRef.IBHi1_5 += 1
+            "LOR" => LORbreakRef.IBHi1_5 += 1
+            "LIR" => LIRbreakRef.IBHi1_5 += 1
+            => 
+                log.error("openType undefined")
+
+    // IBH 2
+    if not na(sessionLevels.ibh2) and high >= sessionLevels.ibh2 and not  brokeSession.ibh2 and firstHourEnded
+
+        if showIBlevels
+            label.new(bar_index, sessionLevels.ibh2, text="IBH2 broken " + str.tostring(sessionLevels.ibh2), style=label.style_label_up, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
+        
+        brokeSession.ibh2 := true
+        breakRef.IBHi2 +=1
+
+
+        switch openType
+            "HIR" => HIRbreakRef.IBHi2 += 1
+            "HOR" => HORbreakRef.IBHi2 += 1
+            "LOR" => LORbreakRef.IBHi2 += 1
+            "LIR" => LIRbreakRef.IBHi2 += 1
+            => 
+                log.error("openType undefined")
+
+    // IBL 1,5
+    if not na(sessionLevels.ibl1_5) and low <= sessionLevels.ibl1_5 and not  brokeSession.ibl1_5 and firstHourEnded
+
+        if showIBlevels
+            label.new(bar_index, sessionLevels.ibl1_5, text="IBL1.5 broken " + str.tostring(sessionLevels.ibl1_5), style=label.style_label_up, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
+        
+        brokeSession.ibl1_5 := true
+        breakRef.IBLo1_5 +=1
+
+
+        switch openType
+            "HIR" => HIRbreakRef.IBLo1_5 += 1
+            "HOR" => HORbreakRef.IBLo1_5 += 1
+            "LOR" => LORbreakRef.IBLo1_5 += 1
+            "LIR" => LIRbreakRef.IBLo1_5 += 1
+            => 
+                log.error("openType undefined")
+
+
+    // IBL 2
+    if not na(sessionLevels.ibl2) and low <= sessionLevels.ibl2 and not  brokeSession.ibl2 and firstHourEnded
+
+        if showIBlevels
+            label.new(bar_index, sessionLevels.ibl2, text="IBL2 broken " + str.tostring(sessionLevels.ibl2), style=label.style_label_up, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
+        
+        brokeSession.ibl2 := true
+        breakRef.IBLo2 +=1
+
+        switch openType
+            "HIR" => HIRbreakRef.IBLo2 += 1
+            "HOR" => HORbreakRef.IBLo2 += 1
+            "LOR" => LORbreakRef.IBLo2 += 1
+            "LIR" => LIRbreakRef.IBLo2 += 1
+            => 
+                log.error("openType undefined")
+
+    // Checking the IBH and IBL after checking for the break checks otherwise we are getting false true 
+    if inTodaySession and (inRange or all_history) and allowTrading
+        if not firstHourEnded
+            sessionLevels.ibh := na(sessionLevels.ibh) ? high : math.max(sessionLevels.ibh, high)
+            sessionLevels.ibl  := na(sessionLevels.ibl)  ? low  : math.min(sessionLevels.ibl, low)
+
+            // Mark end of first hour
+            if time - firstHourStartTime >= 60 * 60 * 1000 and not firstHourEnded
+                firstHourEnded := true
+                distance = sessionLevels.ibh - sessionLevels.ibl
+                sessionLevels.ibh1_5 := sessionLevels.ibh  + distance * 0.5
+                sessionLevels.ibh2 := sessionLevels.ibh + distance 
+                sessionLevels.ibl1_5 := sessionLevels.ibl - distance * 0.5
+                sessionLevels.ibl2 := sessionLevels.ibl - distance 
+
+                if showIBlevels
+                    label.new(bar_index, sessionLevels.ibh, text="IBH " + str.tostring(sessionLevels.ibh), style=label.style_label_down, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+                    label.new(bar_index, sessionLevels.ibl, text="IBL " + str.tostring(sessionLevels.ibl), style=label.style_label_up, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+                    
+                    label.new(bar_index, sessionLevels.ibl1_5, text="IBH1.5 " + str.tostring(sessionLevels.ibl1_5), style=label.style_label_up, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+                    label.new(bar_index, sessionLevels.ibl2, text="IBH2 " + str.tostring(sessionLevels.ibl2), style=label.style_label_up, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+                    label.new(bar_index, sessionLevels.ibh1_5, text="IBL1.5 " + str.tostring(sessionLevels.ibh1_5), style=label.style_label_up, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+                    label.new(bar_index, sessionLevels.ibh2, text="IBL2 " + str.tostring(sessionLevels.ibh2), style=label.style_label_up, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+
+
+    // Yesterday high
+    if not na(prevSessionLevels.high) and not brokeSession.high and ((sessionOpenPrice > prevSessionLevels.high and low <= prevSessionLevels.high) or (sessionOpenPrice < prevSessionLevels.high and high >= prevSessionLevels.high))
+        
+        if showRefLevels
+            label.new(bar_index, prevSessionLevels.high, text="YHI broken " + str.tostring(prevSessionLevels.high) + " " + str.tostring(high) , style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+        
+        breakRef.pHi += 1
+        brokeSession.high := true
+
+        switch openType
+            "HIR" => HIRbreakRef.pHi += 1
+            "HOR" => HORbreakRef.pHi += 1
+            "LOR" => LORbreakRef.pHi += 1
+            "LIR" => LIRbreakRef.pHi += 1
+            => 
+                log.error("openType undefined")
+
+    // Yesterday Low
+    if not na(prevSessionLevels.low) and not brokeSession.low and ((sessionOpenPrice > prevSessionLevels.low and low <= prevSessionLevels.low) or (sessionOpenPrice < prevSessionLevels.low and high >= prevSessionLevels.low))
+        
+        if showRefLevels
+            label.new(bar_index, prevSessionLevels.low, text="YLO broken" + str.tostring(prevSessionLevels.low), style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+        
+        breakRef.pLo += 1
+        brokeSession.low := true
+
+
+        switch openType
+            "HIR" => HIRbreakRef.pLo += 1
+            "HOR" => HORbreakRef.pLo += 1
+            "LOR" => LORbreakRef.pLo += 1
+            "LIR" => LIRbreakRef.pLo += 1
+            => 
+                log.error("openType undefined")
+
+    // Yesterday value area high
+    if not na(prevSessionLevels.vah) and not brokeSession.vah and ((sessionOpenPrice < prevSessionLevels.vah and high >= prevSessionLevels.vah) or (sessionOpenPrice > prevSessionLevels.vah and low <= prevSessionLevels.vah))
+        breakRef.vaHi += 1
+        brokeSession.vah := true
+
+
+        switch openType
+            "HIR" => HIRbreakRef.vaHi += 1
+            "HOR" => HORbreakRef.vaHi += 1
+            "LOR" => LORbreakRef.vaHi += 1
+            "LIR" => LIRbreakRef.vaHi += 1
+            => 
+                log.error("openType undefined")
+    
+    // Yesterday value area low
+    if not na(prevSessionLevels.val) and not brokeSession.val and ((sessionOpenPrice < prevSessionLevels.val and high >= prevSessionLevels.val) or (sessionOpenPrice > prevSessionLevels.val and low <= prevSessionLevels.val))
+        breakRef.pLo += 1
+        brokeSession.val := true
+
+        switch openType
+            "HIR" => HIRbreakRef.vaLo += 1
+            "HOR" => HORbreakRef.vaLo += 1
+            "LOR" => LORbreakRef.vaLo += 1
+            "LIR" => LIRbreakRef.vaLo += 1
+            => 
+                log.error("openType undefined")
+
+
+    if not na(ONLevels.high) and not brokeON.high and ((sessionOpenPrice > ONLevels.high and low <= ONLevels.high) or (sessionOpenPrice < ONLevels.high and high >= ONLevels.high))
+        
+        if showONLevels
+            label.new(bar_index, ONLevels.high, text="ONH broken" + str.tostring(ONLevels.high), style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+        
+        breakRef.onHi += 1
+        brokeON.high := true
+
+        switch openType
+            "HIR" => HIRbreakRef.onHi += 1
+            "HOR" => HORbreakRef.onHi += 1
+            "LOR" => LORbreakRef.onHi += 1
+            "LIR" => LIRbreakRef.onHi += 1
+            => 
+                log.error("openType undefined")
+
+
+    if not na(ONLevels.low) and not brokeON.low and ((sessionOpenPrice > ONLevels.low and low <= ONLevels.low) or (sessionOpenPrice < ONLevels.low and high >= ONLevels.low))
+        
+        if showONLevels
+            label.new(bar_index, ONLevels.low, text="ONL broken " + str.tostring(ONLevels.low), style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+
+        breakRef.onLo += 1
+        brokeON.low := true
+
+        switch openType
+            "HIR" => HIRbreakRef.onLo += 1
+            "HOR" => HORbreakRef.onLo += 1
+            "LOR" => LORbreakRef.onLo += 1
+            "LIR" => LIRbreakRef.onLo += 1
+            => 
+                log.error("openType undefined")
+
+    // Yesterday vpoc
+
+    if not na(prevSessionLevels.vpoc) and not brokeSession.vpoc and ((sessionOpenPrice < prevSessionLevels.vpoc and high >= prevSessionLevels.vpoc) or (sessionOpenPrice > prevSessionLevels.vpoc and low <= prevSessionLevels.vpoc))
+        breakRef.vpoc += 1
+        brokeSession.vpoc := true
+
+        switch openType
+            "HIR" => HIRbreakRef.vpoc += 1
+            "HOR" => HORbreakRef.vpoc += 1
+            "LOR" => LORbreakRef.vpoc += 1
+            "LIR" => LIRbreakRef.vpoc += 1
+            => 
+                log.error("openType undefined")
+    
+    // Overnight vpoc
+    if not na(ONLevels.vpoc) and not brokeON.vpoc and ((sessionOpenPrice < ONLevels.vpoc and high >= ONLevels.vpoc) or (sessionOpenPrice > ONLevels.vpoc and low <= ONLevels.vpoc))
+        // label.new(bar_index, prevVPOC, text="PrevVPOC " + str.tostring(prevVPOC), style=label.style_label_up, color=color.new(color.fuchsia, 0), textcolor=color.white, size=size.small)
+        brokeON.vpoc := true
+        breakRef.onVpoc += 1
+
+        switch openType
+            "HIR" => HIRbreakRef.onVpoc += 1
+            "HOR" => HORbreakRef.onVpoc += 1
+            "LOR" => LORbreakRef.onVpoc += 1
+            "LIR" => LIRbreakRef.onVpoc += 1
+            => 
+                log.error("openType undefined")
+
+    // check low and / or Highs are broken
+    if brokeSession.ibh and brokeSession.ibl and not brokeSession.IBLandIBH
+        breakRef.IBLowandIBH += 1
+        brokeSession.IBLandIBH :=true
+
+        switch openType
+            "HIR" => HIRbreakRef.IBLowandIBH += 1
+            "HOR" => HORbreakRef.IBLowandIBH += 1
+            "LOR" => LORbreakRef.IBLowandIBH += 1
+            "LIR" => LIRbreakRef.IBLowandIBH += 1
+            => 
+                log.error("openType undefined")
+
+    if (brokeSession.ibh or brokeSession.ibl) and not brokeSession.IBLorIBH
+        brokeSession.IBLorIBH :=true
+        breakRef.IBLoworIBH += 1
+
+        switch openType
+            "HIR" => HIRbreakRef.IBLoworIBH += 1
+            "HOR" => HORbreakRef.IBLoworIBH += 1
+            "LOR" => LORbreakRef.IBLoworIBH += 1
+            "LIR" => LIRbreakRef.IBLoworIBH += 1
+            => 
+                log.error("openType undefined")
+
+    if brokeSession.high  and brokeSession.low and not brokeSession.HighandLow
+        brokeSession.HighandLow :=true
+        breakRef.pHiAndpLo += 1
+
+        switch openType
+            "HIR" => HIRbreakRef.pHiAndpLo += 1
+            "HOR" => HORbreakRef.pHiAndpLo += 1
+            "LOR" => LORbreakRef.pHiAndpLo += 1
+            "LIR" => LIRbreakRef.pHiAndpLo += 1
+            => 
+                log.error("openType undefined")
+
+    if (brokeSession.high or brokeSession.low) and not brokeSession.LoworHigh
+        brokeSession.LoworHigh :=true
+        breakRef.pHiorpLo += 1
+
+        switch openType
+            "HIR" => HIRbreakRef.pHiorpLo += 1
+            "HOR" => HORbreakRef.pHiorpLo += 1
+            "LOR" => LORbreakRef.pHiorpLo += 1
+            "LIR" => LIRbreakRef.pHiorpLo += 1
+            => 
+                log.error("openType undefined")
+
+    if brokeON.high and brokeON.low and not brokeON.HighandLow
+        brokeON.HighandLow := true
+        breakRef.onLoAndOnHi += 1
+
+        switch openType
+            "HIR" => HIRbreakRef.onLoAndOnHi += 1
+            "HOR" => HORbreakRef.onLoAndOnHi  += 1
+            "LOR" => LORbreakRef.onLoAndOnHi  += 1
+            "LIR" => LIRbreakRef.onLoAndOnHi  += 1
+            => 
+                log.error("openType undefined")
+
+
+    if (brokeON.high or brokeON.low) and not brokeON.LoworHigh
+        brokeON.LoworHigh := true
+        breakRef.onLowOrOnHi += 1
+
+        switch openType
+            "HIR" => HIRbreakRef.onLowOrOnHi += 1
+            "HOR" => HORbreakRef.onLowOrOnHi += 1
+            "LOR" => LORbreakRef.onLowOrOnHi += 1
+            "LIR" => LIRbreakRef.onLowOrOnHi += 1
+            => 
+                log.error("openType undefined")
+   
+    if brokeSession.vah and brokeSession.val and not brokeSession.VALandVAH
+        brokeSession.VALandVAH := true
+        breakRef.vaLoAndVaHI += 1
+
+        switch openType
+            "HIR" => HIRbreakRef.vaLoAndVaHI += 1
+            "HOR" => HORbreakRef.vaLoAndVaHI += 1
+            "LOR" => LORbreakRef.vaLoAndVaHI += 1
+            "LIR" => LIRbreakRef.vaLoAndVaHI += 1
+            => 
+                log.error("openType undefined")
+
+    if (brokeSession.vah or brokeSession.val) and not brokeSession.VALorVAH
+        brokeSession.VALorVAH := true
+        breakRef.vaLoOrVaHi += 1
+
+        switch openType
+            "HIR" => HIRbreakRef.vaLoOrVaHi += 1
+            "HOR" => HORbreakRef.vaLoOrVaHi  += 1
+            "LOR" => LORbreakRef.vaLoOrVaHi  += 1
+            "LIR" => LIRbreakRef.vaLoOrVaHi  += 1
+            => 
+                log.error("openType undefined")    
+
+        log.info("HORvaLoOrVaHi: "               + str.tostring(HORbreakRef.vaLoOrVaHi))
+        log.info("LORvaLoOrVaHi: "               + str.tostring(LORbreakRef.vaLoOrVaHi))
+
+        log.info("HIRvaLoOrVaHi: "               + str.tostring(HIRbreakRef.vaLoOrVaHi))
+        log.info("LIRvaLoOrVaHi: "               + str.tostring(LIRbreakRef.vaLoOrVaHi))
+
+
+
+// ──────────────────────────────────────────────────────────────
+// Helper: round to 2 dp (optional – makes the log easier to read)
+// ──────────────────────────────────────────────────────────────
+roundPct(v) => math.round((v * 100) / 100, 1)
+
+
+//@variable A 2-row, 15-column table showing "string" representations of numbers, "bool" values, and collections. 
+var table  displayTable1 = table.new(position.bottom_right,3, 100, frame_color = chart.fg_color, frame_width = 1)
+var table displayTable2 = table.new(position.bottom_right,3, 100, frame_color = chart.fg_color, frame_width = 1)
+//@function Initializes a row to show two specified strings in the display table.
+makeRow(table displayTable, int row, string str0, string str1, string counts) =>
+    color bgColor   = row == 0 ? chart.fg_color : chart.bg_color
+    color textColor = row == 0 ? chart.bg_color : chart.fg_color
+    displayTable.cell(0, row, str0, text_color = textColor, text_halign = text.align_left, bgcolor = bgColor)
+    displayTable.cell(1, row, str1, text_color = textColor, text_halign = text.align_left, bgcolor = bgColor)
+    displayTable.cell(2, row, counts, text_color = textColor, text_halign = text.align_left, bgcolor = bgColor)
+
+var table comparisonTable = table.new(position.bottom_right, 8, 25, frame_color=chart.fg_color, frame_width=5)
+
+
+// Function to create a row with multiple category columns
+makeTableHeader(table t, int row, string name,string overall, string in_range,string outside_range, string hir, string hor, string lor, string lir) =>
+    color bgColor   = row == 0 ? chart.fg_color : chart.bg_color
+    color textColor = row == 0 ? chart.bg_color : chart.fg_color
+    t.cell(0, row, name, text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(1, row, overall, text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(2, row, in_range,     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(3, row, outside_range,     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(4, row, hir,     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(5, row, hor,     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(6, row, lor,     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(7, row, lir,     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+
+// Function to create a row with multiple category columns
+makeRow2(table t, int row, string name,float overall, float in_range,float outside_range, float hir, float hor, float lor, float lir) =>
+    color bgColor   = row == 0 ? chart.fg_color : chart.bg_color
+    color textColor = row == 0 ? chart.bg_color : chart.fg_color
+    t.cell(0, row, name, text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(1, row, str.tostring(overall), text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(2, row, str.tostring(in_range),     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(3, row, str.tostring(outside_range),     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(4, row, str.tostring(hir),     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(5, row, str.tostring(hor),     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(6, row, str.tostring(lor),     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+    t.cell(7, row, str.tostring(lir),     text_color=textColor, text_halign=text.align_left, bgcolor=bgColor)
+
+// === DISPLAY STATS ===
+var label statsLabel = na
+if barstate.islastconfirmedhistory
+
+
+    // ──────────────────────────────────────────────────────────────
+    // Overall section
+    // ──────────────────────────────────────────────────────────────
+    log.info("==============================")
+    log.info("Probabilities")
+    log.info("==============================")
+    log.info("Overall")
+
+    log.info("Days: " + str.tostring(breakRef.sessionCounts))
+
+    // --- percentages ------------------------------------------------
+    pctYHI          = roundPct(breakRef.pHi          / breakRef.sessionCounts * 100)
+    pctYLO          = roundPct(breakRef.pLo           / breakRef.sessionCounts * 100)
+    pctYHIandYLO    = roundPct(breakRef.pHiAndpLo    / breakRef.sessionCounts * 100)
+    pctYHIorYLO     = roundPct(breakRef.pHiorpLo     / breakRef.sessionCounts * 100)
+
+    pctONHigh       = roundPct(breakRef.onHi          / breakRef.sessionCounts * 100)
+    pctONLow        = roundPct(breakRef.onLo           / breakRef.sessionCounts * 100)
+    pctONHighLow    = roundPct(breakRef.onLoAndOnHi    / breakRef.sessionCounts * 100)
+    pctONHighOrLow  = roundPct(breakRef.onLowOrOnHi     / breakRef.sessionCounts * 100)
+
+    pctVPOC         = roundPct(breakRef.vpoc          / breakRef.sessionCounts * 100)
+    pctONVPOC       = roundPct(breakRef.onVpoc          / breakRef.sessionCounts * 100)
+    pctVAL          = roundPct(breakRef.vaLo          / breakRef.sessionCounts * 100)
+    pctVAH          = roundPct(breakRef.vaHi           / breakRef.sessionCounts * 100)
+    pctVAHorVAL     = roundPct(breakRef.vaLoOrVaHi    / breakRef.sessionCounts * 100)
+    pctVAHandVAL    = roundPct(breakRef.vaLoAndVaHI    / breakRef.sessionCounts * 100)
+
+
+    pctIBH          = roundPct(breakRef.IBHi        / breakRef.sessionCounts * 100)
+    pctIBL          = roundPct(breakRef.IBLo           / breakRef.sessionCounts * 100)
+    pctIBHandIBL    = roundPct(breakRef.IBLowandIBH  / breakRef.sessionCounts * 100)
+    pctIBHorIBL     = roundPct(breakRef.IBLoworIBH   / breakRef.sessionCounts * 100)
+
+    // --- logging ----------------------------------------------------
+    log.info("YHI Breaks: "               + str.tostring(pctYHI))
+    log.info("YLO Breaks: "               + str.tostring(pctYLO))
+    log.info("YHI and YLO: "              + str.tostring(pctYHIandYLO))
+    log.info("YHI or YLO: "               + str.tostring(pctYHIorYLO))
+    log.info("ON high Breaks: "           + str.tostring(pctONHigh))
+    log.info("ON Low Breaks: "            + str.tostring(pctONLow))
+    log.info("ON high and Low Breaks: "   + str.tostring(pctONHighLow))
+    log.info("ON high or Low Breaks: "    + str.tostring(pctONHighOrLow))
+    log.info("IBH Breaks: "               + str.tostring(pctIBH))
+    log.info("IBL Breaks: "               + str.tostring(pctIBL))
+    log.info("IBH and IBL: "              + str.tostring(pctIBHandIBL))
+    log.info("IBH or IBL: "               + str.tostring(pctIBHorIBL))
+    log.info("==============================")
+
+    // ──────────────────────────────────────────────────────────────
+    // HIR section
+    // ──────────────────────────────────────────────────────────────
+    log.info("HIR")
+    log.info("Days: " + str.tostring(HIRbreakRef.sessionCounts))
+
+    pctHIRYHI          = roundPct(HIRbreakRef.pHi         / HIRbreakRef.sessionCounts * 100)
+    pctHIRYLO          = roundPct(HIRbreakRef.pLo           / HIRbreakRef.sessionCounts * 100)
+    pctHIRYHIandYLO    = roundPct(HIRbreakRef.pHiAndpLo   / HIRbreakRef.sessionCounts * 100)
+    pctHIRYHIorYLO     = roundPct(HIRbreakRef.pHiorpLo     / HIRbreakRef.sessionCounts * 100)
+
+    pctHIROnHigh       = roundPct(HIRbreakRef.onHi        / HIRbreakRef.sessionCounts * 100)
+    pctHIROnLow        = roundPct(HIRbreakRef.onLo           / HIRbreakRef.sessionCounts * 100)
+    pctHIROnHighLow    = roundPct(HIRbreakRef.onLoAndOnHi   / HIRbreakRef.sessionCounts * 100)
+    pctHIROnHighOrLow  = roundPct(HIRbreakRef.onLowOrOnHi     / HIRbreakRef.sessionCounts * 100)
+
+
+    pctHIRVPOC         = roundPct(HIRbreakRef.vpoc          / HIRbreakRef.sessionCounts * 100)
+    pctHIRONVPOC       = roundPct(HIRbreakRef.onVpoc          / HIRbreakRef.sessionCounts * 100)
+    pctHIRVAL          = roundPct(HIRbreakRef.vaLo          / HIRbreakRef.sessionCounts * 100)
+    pctHIRVAH          = roundPct(HIRbreakRef.vaHi           / HIRbreakRef.sessionCounts * 100)
+    pctHIRVAHorVAL     = roundPct(HIRbreakRef.vaLoOrVaHi    / HIRbreakRef.sessionCounts * 100)
+    pctHIRVAHandVAL    = roundPct(HIRbreakRef.vaLoAndVaHI    / HIRbreakRef.sessionCounts * 100)
+
+    pctHIRIBH          = roundPct(HIRbreakRef.IBHi         / HIRbreakRef.sessionCounts * 100)
+    pctHIRIBL          = roundPct(HIRbreakRef.IBLo           / HIRbreakRef.sessionCounts * 100)
+    pctHIRIBHandIBL    = roundPct(HIRbreakRef.IBLowandIBH  / HIRbreakRef.sessionCounts * 100)
+    pctHIRIBHorIBL     = roundPct(HIRbreakRef.IBLoworIBH   / HIRbreakRef.sessionCounts * 100)
+
+    log.info("YHI Breaks: "               + str.tostring(pctHIRYHI))
+    log.info("YLO Breaks: "               + str.tostring(pctHIRYLO))
+    log.info("YHI and YLO: "              + str.tostring(pctHIRYHIandYLO))
+    log.info("YHI or YLO: "               + str.tostring(pctHIRYHIorYLO))
+    log.info("ON high Breaks: "           + str.tostring(pctHIROnHigh))
+    log.info("ON Low Breaks: "            + str.tostring(pctHIROnLow))
+    log.info("ON high and Low Breaks: "   + str.tostring(pctHIROnHighLow))
+    log.info("ON high or Low Breaks: "    + str.tostring(pctHIROnHighOrLow))
+    log.info("==============================")
+
+    // ──────────────────────────────────────────────────────────────
+    // HOR section
+    // ──────────────────────────────────────────────────────────────
+    log.info("HOR")
+    log.info("Days: " + str.tostring(HORbreakRef.sessionCounts))
+
+    pctHORYHI          = roundPct(HORbreakRef.pHi          / HORbreakRef.sessionCounts * 100)
+    pctHORYLO          = roundPct(HORbreakRef.pLo           / HORbreakRef.sessionCounts * 100)
+    pctHORYHIandYLO    = roundPct(HORbreakRef.pHiAndpLo     / HORbreakRef.sessionCounts * 100)
+    pctHORYHIorYLO     = roundPct(HORbreakRef.pHiorpLo      / HORbreakRef.sessionCounts * 100)
+
+    pctHOROnHigh       = roundPct(HORbreakRef.onHi          / HORbreakRef.sessionCounts * 100)
+    pctHOROnLow        = roundPct(HORbreakRef.onLo        / HORbreakRef.sessionCounts * 100)
+    pctHOROnHighLow    = roundPct(HORbreakRef.onLoAndOnHi     / HORbreakRef.sessionCounts * 100)
+    pctHOROnHighOrLow  = roundPct(HORbreakRef.onLowOrOnHi   / HORbreakRef.sessionCounts * 100)
+
+    pctHORVPOC         = roundPct(HORbreakRef.vpoc          / HORbreakRef.sessionCounts * 100)
+    pctHORONVPOC       = roundPct(HORbreakRef.onVpoc          / HORbreakRef.sessionCounts * 100)
+    pctHORVAL          = roundPct(HORbreakRef.vaLo          / HORbreakRef.sessionCounts * 100)
+    pctHORVAH          = roundPct(HORbreakRef.vaHi           / HORbreakRef.sessionCounts * 100)
+    pctHORVAHorVAL     = roundPct(HORbreakRef.vaLoOrVaHi    / HORbreakRef.sessionCounts * 100)
+    pctHORVAHandVAL    = roundPct(HORbreakRef.vaLoAndVaHI    / HORbreakRef.sessionCounts * 100)
+
+    pctHORIBH          = roundPct(HORbreakRef.IBHi         / HORbreakRef.sessionCounts * 100)
+    pctHORIBL          = roundPct(HORbreakRef.IBLo           / HORbreakRef.sessionCounts * 100)
+    pctHORIBHandIBL    = roundPct(HORbreakRef.IBLowandIBH   / HORbreakRef.sessionCounts * 100)
+    pctHORIBHorIBL     = roundPct(HORbreakRef.IBLoworIBH   / HORbreakRef.sessionCounts * 100)
+
+    log.info("YHI Breaks: "               + str.tostring(pctHORYHI))
+    log.info("YLO Breaks: "               + str.tostring(pctHORYLO))
+    log.info("YHI and YLO: "              + str.tostring(pctHORYHIandYLO))
+    log.info("YHI or YLO: "               + str.tostring(pctHORYHIorYLO))
+    log.info("ON high Breaks: "           + str.tostring(pctHOROnHigh))
+    log.info("ON Low Breaks: "            + str.tostring(pctHOROnLow))
+    log.info("ON high and Low Breaks: "   + str.tostring(pctHOROnHighLow))
+    log.info("ON high or Low Breaks: "    + str.tostring(pctHOROnHighOrLow))
+    log.info("==============================")
+
+    // ──────────────────────────────────────────────────────────────
+    // LOR section
+    // ──────────────────────────────────────────────────────────────
+    log.info("LOR")
+    log.info("Days: " + str.tostring(LORbreakRef.sessionCounts))
+
+    pctLORYHI          = roundPct(LORbreakRef.pHi          / LORbreakRef.sessionCounts * 100)
+    pctLORYLO          = roundPct(LORbreakRef.pLo           / LORbreakRef.sessionCounts * 100)
+    pctLORYHIandYLO    = roundPct(LORbreakRef.pHiAndpLo     / LORbreakRef.sessionCounts * 100)
+    pctLORYHIorYLO     = roundPct(LORbreakRef.pHiorpLo      / LORbreakRef.sessionCounts * 100)
+
+    pctLOROnHigh       = roundPct(LORbreakRef.onHi         / LORbreakRef.sessionCounts * 100)
+    pctLOROnLow        = roundPct(LORbreakRef.onLo        / LORbreakRef.sessionCounts * 100)
+    pctLOROnHighLow    = roundPct(LORbreakRef.onLoAndOnHi     / LORbreakRef.sessionCounts * 100)
+    pctLOROnHighOrLow  = roundPct(LORbreakRef.onLowOrOnHi   / LORbreakRef.sessionCounts * 100)
+
+    pctLORVPOC         = roundPct(LORbreakRef.vpoc          / LORbreakRef.sessionCounts * 100)
+    pctLORONVPOC       = roundPct(LORbreakRef.onVpoc          / LORbreakRef.sessionCounts * 100)
+    pctLORVAL          = roundPct(LORbreakRef.vaLo          / LORbreakRef.sessionCounts * 100)
+    pctLORVAH          = roundPct(LORbreakRef.vaHi           / LORbreakRef.sessionCounts * 100)
+    pctLORVAHorVAL     = roundPct(LORbreakRef.vaLoOrVaHi    / LORbreakRef.sessionCounts * 100)
+    pctLORVAHandVAL    = roundPct(LORbreakRef.vaLoAndVaHI    / LORbreakRef.sessionCounts * 100)
+
+
+    pctLORIBH          = roundPct(LORbreakRef.IBHi         / LORbreakRef.sessionCounts * 100)
+    pctLORIBL          = roundPct(LORbreakRef.IBLo           / LORbreakRef.sessionCounts * 100)
+    pctLORIBHandIBL    = roundPct(LORbreakRef.IBLowandIBH   / LORbreakRef.sessionCounts * 100)
+    pctLORIBHorIBL     = roundPct(LORbreakRef.IBLoworIBH   / LORbreakRef.sessionCounts * 100)
+
+    log.info("YHI Breaks: "               + str.tostring(pctLORYHI))
+    log.info("YLO Breaks: "               + str.tostring(pctLORYLO))
+    log.info("YHI and YLO: "              + str.tostring(pctLORYHIandYLO))
+    log.info("YHI or YLO: "               + str.tostring(pctLORYHIorYLO))
+    log.info("ON high Breaks: "           + str.tostring(pctLOROnHigh))
+    log.info("ON Low Breaks: "            + str.tostring(pctLOROnLow))
+    log.info("ON high and Low Breaks: "   + str.tostring(pctLOROnHighLow))
+    log.info("ON high or Low Breaks: "    + str.tostring(pctLOROnHighOrLow))
+    log.info("==============================")
+
+    // ──────────────────────────────────────────────────────────────
+    // LIR section
+    // ──────────────────────────────────────────────────────────────
+    log.info("LIR")
+    log.info("Days: " + str.tostring(LIRbreakRef.sessionCounts))
+
+    pctLIRYHI          = roundPct(LIRbreakRef.pHi          / LIRbreakRef.sessionCounts * 100)
+    pctLIRYLO          = roundPct(LIRbreakRef.pLo           / LIRbreakRef.sessionCounts * 100)
+    pctLIRYHIandYLO    = roundPct(LIRbreakRef.pHiAndpLo     / LIRbreakRef.sessionCounts * 100)
+    pctLIRYHIorYLO     = roundPct(LIRbreakRef.pHiorpLo      / LIRbreakRef.sessionCounts * 100)
+
+    pctLIROnHigh       = roundPct(LIRbreakRef.onHi           / LIRbreakRef.sessionCounts * 100)
+    pctLIROnLow        = roundPct(LIRbreakRef.onLo           / LIRbreakRef.sessionCounts * 100)
+    pctLIROnHighLow    = roundPct(LIRbreakRef.onLoAndOnHi     / LIRbreakRef.sessionCounts * 100)
+    pctLIROnHighOrLow  = roundPct(LIRbreakRef.onLowOrOnHi   / LIRbreakRef.sessionCounts * 100)
+
+    pctLIRVPOC         = roundPct(LIRbreakRef.vpoc          / LIRbreakRef.sessionCounts * 100)
+    pctLIRONVPOC       = roundPct(LIRbreakRef.onVpoc          / LIRbreakRef.sessionCounts * 100)
+    pctLIRVAL          = roundPct(LIRbreakRef.vaLo          / LIRbreakRef.sessionCounts * 100)
+    pctLIRVAH          = roundPct(LIRbreakRef.vaHi           / LIRbreakRef.sessionCounts * 100)
+    pctLIRVAHorVAL     = roundPct(LIRbreakRef.vaLoOrVaHi    / LIRbreakRef.sessionCounts * 100)
+    pctLIRVAHandVAL    = roundPct(LIRbreakRef.vaLoAndVaHI    / LIRbreakRef.sessionCounts * 100)
+
+    pctLIRIBH          = roundPct(LIRbreakRef.IBHi         / LIRbreakRef.sessionCounts * 100)
+    pctLIRIBL          = roundPct(LIRbreakRef.IBLo        / LIRbreakRef.sessionCounts * 100)
+    pctLIRIBHandIBL    = roundPct(LIRbreakRef.IBLowandIBH   / LIRbreakRef.sessionCounts * 100)
+    pctLIRIBHorIBL     = roundPct(LIRbreakRef.IBLoworIBH   / LIRbreakRef.sessionCounts * 100)
+
+    log.info("YHI Breaks: "               + str.tostring(pctLIRYHI))
+    log.info("YLO Breaks: "               + str.tostring(pctLIRYLO))
+    log.info("YHI and YLO: "              + str.tostring(pctLIRYHIandYLO))
+    log.info("YHI or YLO: "               + str.tostring(pctLIRYHIorYLO))
+
+    log.info("ON high Breaks: "           + str.tostring(pctLIROnHigh))
+    log.info("ON Low Breaks: "            + str.tostring(pctLIROnLow))
+    log.info("ON high and Low Breaks: "   + str.tostring(pctLIROnHighLow))
+    log.info("ON high or Low Breaks: "    + str.tostring(pctLIROnHighOrLow))
+
+    log.info("IBHigh Breaks: "           + str.tostring(pctLIRIBH))
+    log.info("IBLow Breaks: "            + str.tostring(pctLIRIBL))
+    log.info("IBHigh and Low Breaks: "   + str.tostring(pctLIRIBHandIBL))
+    log.info("IBHigh or Low Breaks: "    + str.tostring(pctLIRIBHorIBL))
+    log.info("IBHigh and Low counts: "    + str.tostring(LIRbreakRef.IBLowandIBH ))
+    log.info("IBHigh or Low counts: "   + str.tostring(LIRbreakRef.IBLoworIBH))
+    log.info("==============================")
+
+
+    // ──────────────────────────────────────────────────────────────
+    // OR section
+    // ──────────────────────────────────────────────────────────────
+    log.info("OR")
+    orSessionCounts = LORbreakRef.sessionCounts + HORbreakRef.sessionCounts
+    log.info("Days: " + str.tostring(orSessionCounts))
+
+    pctORYHI          = roundPct((LORbreakRef.pHi + HORbreakRef.pHi)    / orSessionCounts * 100)
+    pctORYLO          = roundPct((LORbreakRef.pLo + HORbreakRef.pLo)       / orSessionCounts * 100)
+    pctORYHIandYLO    = roundPct((LORbreakRef.pHiAndpLo + HORbreakRef.pHiAndpLo)     / orSessionCounts * 100)
+    pctORYHIorYLO     = roundPct((LORbreakRef.pHiorpLo + HORbreakRef.pHiorpLo)      / orSessionCounts * 100)
+
+    pctOROnHigh       = roundPct((LORbreakRef.onHi + HORbreakRef.onHi)         / orSessionCounts * 100)
+    pctOROnLow        = roundPct((LORbreakRef.onLo + HORbreakRef.onLo)        / orSessionCounts * 100)
+    pctOROnHighLow    = roundPct((LORbreakRef.onLoAndOnHi + HORbreakRef.onLoAndOnHi)     / orSessionCounts * 100)
+    pctOROnHighorLow  = roundPct((LORbreakRef.onLowOrOnHi + HORbreakRef.onLowOrOnHi)   / orSessionCounts * 100)
+
+    pctORVPOC         = roundPct((LORbreakRef.vpoc + HORbreakRef.vpoc)        / orSessionCounts * 100)
+    pctORONVPOC       = roundPct((LORbreakRef.onVpoc + HORbreakRef.onVpoc)  / orSessionCounts * 100)
+    pctORVAL          = roundPct((LORbreakRef.vaLo + HORbreakRef.vaLo)          / orSessionCounts * 100)
+    pctORVAH          = roundPct((LORbreakRef.vaHi + HORbreakRef.vaHi)          / orSessionCounts * 100)
+    pctORVAHorVAL     = roundPct((LORbreakRef.vaLoOrVaHi + HORbreakRef.vaLoOrVaHi)    / orSessionCounts * 100)
+    pctORVAHandVAL    = roundPct((LORbreakRef.vaLoAndVaHI + HORbreakRef.vaLoAndVaHI)   / orSessionCounts * 100)
+
+    pctORIBH          = roundPct((LORbreakRef.IBHi + HORbreakRef.IBHi)         / orSessionCounts * 100)
+    pctORIBL          = roundPct((LORbreakRef.IBLo + HORbreakRef.IBLo)           / orSessionCounts * 100)
+    pctORIBHandIBL    = roundPct((LORbreakRef.IBLowandIBH + HORbreakRef.IBLowandIBH)   / orSessionCounts * 100)
+    pctORIBHorIBL     = roundPct((LORbreakRef.IBLoworIBH + HORbreakRef.IBLoworIBH)   / orSessionCounts * 100)
+
+  // ──────────────────────────────────────────────────────────────
+    // IR section
+    // ──────────────────────────────────────────────────────────────
+    log.info("IR")
+    irSessionCounts = LIRbreakRef.sessionCounts + HIRbreakRef.sessionCounts
+    log.info("Days: " + str.tostring(irSessionCounts))
+
+    pctIRYHI          = roundPct((LIRbreakRef.pHi + HIRbreakRef.pHi   )  / irSessionCounts * 100)
+    pctIRYLO          = roundPct((LIRbreakRef.pLo + HIRbreakRef.pLo     )  / irSessionCounts * 100)
+    pctIRYHIandYLO    = roundPct((LIRbreakRef.pHiAndpLo + HIRbreakRef.pHiAndpLo   )  / irSessionCounts * 100)
+    pctIRYHIorYLO     = roundPct((LIRbreakRef.pHiorpLo + HIRbreakRef.pHiorpLo    )  / irSessionCounts * 100)
+
+    pctIROnHigh       = roundPct((LIRbreakRef.onHi + HIRbreakRef.onHi       )  / irSessionCounts * 100)
+    pctIROnLow        = roundPct((LIRbreakRef.onLo + HIRbreakRef.onLo      )  / irSessionCounts * 100)
+    pctIROnHighLow    = roundPct((LIRbreakRef.onLoAndOnHi + HIRbreakRef.onLoAndOnHi   )  / irSessionCounts * 100)
+    pctIROnHighorLow  = roundPct((LIRbreakRef.onLowOrOnHi + HIRbreakRef.onLowOrOnHi )  / irSessionCounts * 100)
+
+    pctIRVPOC         = roundPct((LIRbreakRef.vpoc + HIRbreakRef.vpoc      )  / irSessionCounts * 100)
+    pctIRONVPOC       = roundPct((LIRbreakRef.onVpoc + HIRbreakRef.onVpoc)  / irSessionCounts * 100)
+    pctIRVAL          = roundPct((LIRbreakRef.vaLo + HIRbreakRef.vaLo        )  / irSessionCounts * 100)
+    pctIRVAH          = roundPct((LIRbreakRef.vaHi + HIRbreakRef.vaHi        )  / irSessionCounts * 100)
+
+    log.info("LIRvaLoOrVaHi: "               + str.tostring(LIRbreakRef.vaLoOrVaHi))
+    log.info("LIRvaLoOrVaHi: "               + str.tostring(HIRbreakRef.vaLoOrVaHi))
+    log.info("irSessionCounts: "               + str.tostring(irSessionCounts))
+
+    pctIRVAHorVAL     = roundPct((LIRbreakRef.vaLoOrVaHi + HIRbreakRef.vaLoOrVaHi)  / irSessionCounts * 100)
+    pctIRVAHandVAL    = roundPct((LIRbreakRef.vaLoAndVaHI + HIRbreakRef.vaLoAndVaHI )  / irSessionCounts * 100)
+
+    pctIRIBH1_5         = roundPct((LIRbreakRef.IBHi1_5 + HIRbreakRef.IBHi1_5       )  / irSessionCounts * 100)
+    pctIRIBH          = roundPct((LIRbreakRef.IBHi + HIRbreakRef.IBHi       )  / irSessionCounts * 100)
+    pctIRIBL          = roundPct((LIRbreakRef.IBLo + HIRbreakRef.IBLo         )  / irSessionCounts * 100)
+    pctIRIBHandIBL    = roundPct((LIRbreakRef.IBLowandIBH + HIRbreakRef.IBLowandIBH )  / irSessionCounts * 100)
+    pctIRIBHIorIBL     = roundPct((LIRbreakRef.IBLoworIBH + HIRbreakRef.IBLoworIBH )  / irSessionCounts * 100)
+
+    pctORdays     = roundPct(orSessionCounts   / breakRef.sessionCounts * 100)
+    pctIRdays     = roundPct(irSessionCounts   / breakRef.sessionCounts * 100)
+
+    pctHIRdays     = roundPct(HIRbreakRef.sessionCounts   / breakRef.sessionCounts * 100)
+    pctLIRdays     = roundPct(LIRbreakRef.sessionCounts   / breakRef.sessionCounts * 100)
+    pctHORdays     = roundPct(HORbreakRef.sessionCounts   / breakRef.sessionCounts * 100)
+    pctLORdays     = roundPct(LORbreakRef.sessionCounts   / breakRef.sessionCounts * 100)
+
+    label.delete(statsLabel)
+
+    statsText = "Days: " + str.tostring(breakRef.sessionCounts) + "\nRef high Breaks: " + str.tostring(breakRef.pHi) + "\nRef Low Breaks: " + str.tostring(breakRef.pLo) + "\nON high Breaks: " + str.tostring(breakRef.onHi) + "\nON Low Breaks: " + str.tostring(breakRef.onLo) + "\nON IBH Breaks: " + str.tostring(breakRef.IBHi) + "\nON IBL Breaks: " + str.tostring(breakRef.IBLo)
+
+    // statsLabel := label.new(bar_index, high, statsText, style=label.style_label_left, textcolor=color.white, color=color.new(color.black, 70))
+    
+    // statsText2 = "Days: " + str.tostring(breakRef.sessionCounts) + "\nONH and ONL breaks: " + str.tostring(breakRef.onLoAndOnHi) + "\nONH or ONL breaks: " + str.tostring(breakRef.onLowOrOnHi) + "\nHigh and Low Breaks: " + str.tostring(breakRef.pHiAndpLo) + "\nHigh or Low Breaks: " + str.tostring(breakRef.pHiorpLo) + "\nIBH and IBL Breaks: " + str.tostring(breakRef.IBLowandIBH) + "\nIBH or IBL Breaks: " + str.tostring(breakRef.IBLoworIBH)
+    // label.new(bar_index, high - (high*0.3), statsText2, style=label.style_label_left, textcolor=color.white, color=color.new(color.black, 70))
+    // // Print to console logs
+    // log.info("===== Session Break Stats =====")
+    // log.info("Days: " + str.tostring(breakRef.sessionCounts))
+    // log.info("Ref high Breaks: " + str.tostring(refHighBreaks) + " | Ref Low Breaks: " + str.tostring(refLowBreaks))
+    // log.info("VAH Breaks: " + str.tostring(vahBreaks) + " | VAL Breaks: " + str.tostring(valBreaks) + " | VPOC Breaks: " + str.tostring(vpocBreaks))
+    // log.info("ON high Breaks: " + str.tostring(onHighBreaks) + " | ON Low Breaks: " + str.tostring(onLowBreaks) + " | ON VPOC Breaks: " + str.tostring(onVpocBreaks))
+    // log.info("ON high and Low Breaks: " + str.tostring(onLowandHighBreaks))
+    // log.info("high and Low Breaks: " + str.tostring(refHighandLowBreaks))
+    // log.info("ON high or Low Breaks: " + str.tostring(onLoworHighBreaks))
+    // log.info("high or Low Breaks: " + str.tostring(refHighorLowBreaks))
+    // log.info("IBH and IBL Breaks: " + str.tostring(refIBLowandIBHBreaks))
+    // log.info("IBH or IBL Breaks: " + str.tostring(refIBLoworIBHBreaks))
+
+
+    // Table Header
+    makeTableHeader(comparisonTable, 0, "Variable", "Overall", "IR", "OR", "HIR", "HOR", "LOR", "LIR")
+
+
+    makeRow2(comparisonTable, 1, "YHI %",           pctYHI,         pctIRYHI,       pctORYHI,       pctHIRYHI,          pctHORYHI,          pctLORYHI,              pctLIRYHI)
+    makeRow2(comparisonTable, 2, "YLO %",           pctYLO,         pctIRYLO,       pctORYLO,       pctHIRYLO,          pctHORYLO,          pctLORYLO,              pctLIRYLO)
+    makeRow2(comparisonTable, 3, "YHI and YLO %",   pctYHIandYLO,   pctIRYHIandYLO, pctORYHIandYLO, pctHIRYHIandYLO,    pctHORYHIandYLO,    pctLORYHIandYLO,        pctLIRYHIandYLO)
+    makeRow2(comparisonTable, 4, "YHI or YLO %",    pctYHIorYLO,    pctIRYHIorYLO,  pctORYHIorYLO,  pctHIRYHIorYLO,     pctHORYHIorYLO,     pctLORYHIorYLO,         pctLIRYHIorYLO)
+    makeRow2(comparisonTable, 5, "ON High %",       pctONHigh,      pctIROnHigh,    pctOROnHigh,    pctHIROnHigh,       pctHOROnHigh,       pctLOROnHigh,           pctLIROnHigh)
+    makeRow2(comparisonTable, 6, "ON Low %",        pctONLow,       pctIROnLow,     pctOROnLow,     pctHIROnLow,        pctHOROnLow,        pctLOROnLow,            pctLIROnLow)
+    makeRow2(comparisonTable, 7, "ON High & Low %", pctONHighLow,   pctIROnHighLow, pctOROnHighLow, pctHIROnHighLow,    pctHOROnHighLow,    pctLOROnHighLow,        pctLIROnHighLow)
+    makeRow2(comparisonTable, 8, "ON High or Low %", pctONHighOrLow,pctIROnHighorLow, pctOROnHighorLow, pctHIROnHighOrLow, pctHOROnHighOrLow, pctLOROnHighOrLow,    pctLIROnHighOrLow)
+    makeRow2(comparisonTable, 9, "IBH %",           pctIBH,         pctIRIBH,       pctORIBH,       pctHIRIBH,          pctHORIBH,          pctLORIBH,              pctLIRIBH)
+    makeRow2(comparisonTable, 10, "IBL %",          pctIBL,         pctIRIBL,       pctORIBL,       pctHIRIBL,          pctHORIBL,          pctLORIBL,              pctLIRIBL)
+    makeRow2(comparisonTable, 11, "IBH and IBL %",  pctIBHandIBL,   pctIRIBHandIBL, pctORIBHandIBL, pctHIRIBHandIBL,    pctHORIBHandIBL,    pctLORIBHandIBL,        pctLIRIBHandIBL)
+    makeRow2(comparisonTable, 12, "IBH or IBL %",   pctIBHorIBL,    pctIRIBHIorIBL, pctORIBHorIBL,  pctHIRIBHorIBL,     pctHORIBHorIBL,     pctLORIBHorIBL,         pctLIRIBHorIBL)
+    
+    makeRow2(comparisonTable, 13, "VPOC %",         pctVPOC,        pctIRVPOC,      pctORVPOC,      pctHIRVPOC,         pctHORVPOC,         pctLORVPOC,         pctLIRVPOC)
+    makeRow2(comparisonTable, 14, "ONVPOC %",       pctONVPOC,      pctIRONVPOC,    pctORONVPOC,    pctHIRONVPOC,       pctHORONVPOC,       pctLORONVPOC,       pctLIRONVPOC)
+    makeRow2(comparisonTable, 15, "VAL %",          pctVAL,         pctIRVAL,       pctORVAL,       pctHIRVAL,          pctHORVAL,          pctLORVAL,          pctLIRVAL)
+    makeRow2(comparisonTable, 16, "VAH %",          pctVAH,         pctIRVAH,       pctORVAH,       pctHIRVAH,          pctHORVAH,          pctLORVAH,          pctLIRVAH)
+    makeRow2(comparisonTable, 17, "VAL or VAH %",   pctVAHorVAL,    pctIRVAHorVAL,  pctORVAHorVAL,  pctHIRVAHorVAL,     pctHORVAHorVAL,     pctLORVAHorVAL,     pctLIRVAHorVAL)
+    makeRow2(comparisonTable, 18, "VAL and VAH %",  pctVAHandVAL,   pctIRVAHandVAL, pctORVAHandVAL, pctHIRVAHandVAL,    pctHORVAHandVAL,    pctLORVAHandVAL,    pctLIRVAHandVAL)
+    
+
+    makeRow2(comparisonTable, 19, "sessions %", pctIRdays + pctORdays,   pctIRdays, pctORdays, pctHIRdays, pctHORdays, pctLIRdays, pctLORdays)
+    makeRow2(comparisonTable, 20, "sessions total",   breakRef.sessionCounts, irSessionCounts,orSessionCounts, HIRbreakRef.sessionCounts, HORbreakRef.sessionCounts, LORbreakRef.sessionCounts, LIRbreakRef.sessionCounts)
+    makeRow2(comparisonTable, 21, "sessions total",   breakRef.sessionCounts, irSessionCounts,orSessionCounts, HIRbreakRef.sessionCounts, HORbreakRef.sessionCounts, LORbreakRef.sessionCounts, LIRbreakRef.sessionCounts)
